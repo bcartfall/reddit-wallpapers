@@ -1,0 +1,17 @@
+{
+  "subreddits": [
+    "EarthPorn",
+    "Wallpaper",
+    "CityPorn",
+    "MostBeautiful",
+    "VillagePorn",
+    "TravelPorn",
+    "waterporn",
+    "ArchitecturePorn"
+  ],
+  "save_location": "./",
+  "num_posts": 25,
+  "min_megapixels": 4,
+  "sort": "top",
+  "time_filter": "month"
+}
