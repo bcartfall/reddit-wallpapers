@@ -1,0 +1,9 @@
+// resources/app.rc
+// Application resource file
+
+#include <windows.h>
+
+// Application icon - replace wallpaper.ico with your own icon file
+// The icon is referenced in the tray via CreateTrayIcon() in code,
+// but having it here also sets the EXE file icon in Explorer.
+IDI_APPICON ICON "wallpaper.ico"

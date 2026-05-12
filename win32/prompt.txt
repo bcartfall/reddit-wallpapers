@@ -1,0 +1,21 @@
+Create a win32 c++ app that runs every 30 minutes (set in json config). It changes the wallpaper on all monitors to a random wallpaper from wallpaper.db sqlite3 database.
+- 75% of the time it chooses a random entry from the `wallpapers` table where the lowest number of views is selected (if equal then it's random)
+- 25% of the time it chooses a random from the whole table.
+- When selected, it increments views = views + 1.
+- On launch is selects random wallpapers
+
+The table schema is: id, filename, subreddit, width, height, views
+
+Program uses a json config file that stores:
+{
+	reddit_wallpaper_path: "\\nas\...",
+	minutes: 30,
+}
+
+- The db is stored at reddit_wallpaper_path + "\db\wallpapers.db"
+- The wallpaper image files are stored at reddit_wallpaper_path + "\wallpapers"
+
+- The main window is hidden and has no content, no taskbar presence
+- The app has a system tray with the title "Reddit Wallpapers"
+	- Menu item to: "Select Random Wallpaper"
+	- Icon ico of a wallpaper
