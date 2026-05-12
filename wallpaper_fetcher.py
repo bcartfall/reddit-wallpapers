@@ -439,7 +439,9 @@ def init_db(save_dir: Path) -> sqlite3.Connection:
             subreddit TEXT    NOT NULL,
             width     INTEGER NOT NULL,
             height    INTEGER NOT NULL,
-            views     INTEGER NOT NULL DEFAULT 0
+            active    BOOLEAN NOT NULL DEFAULT 1,
+            views     INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -669,6 +671,11 @@ def main():
 
     db_conn.close()
 
+    # clear tmp files
+    for tmp_file in wallpaper_dir.glob("_tmp.*"):
+        logger.info(f"Clearing tmp file {tmp_file}.")
+        tmp_file.unlink(missing_ok=True)
+
     logger.info("═" * 60)
     logger.info("Summary")
     logger.info(f"  Posts fetched    : {totals['fetched']}")
@@ -681,11 +688,6 @@ def main():
     logger.info(f"  Failed ✗         : {totals['failed']}")
     logger.info("═" * 60)
     logger.info("Done.")
-
-    # clear tmp files
-    for tmp_file in wallpaper_dir.glob("_tmp.*"):
-        logger.info(f"Clearing tmp file {tmp_file}.")
-        tmp_file.unlink(missing_ok=True)
 
 if __name__ == "__main__":
     main()

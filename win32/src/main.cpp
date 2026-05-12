@@ -127,11 +127,13 @@ static bool SelectWallpaper(Wallpaper& out) {
         // All rows sharing the minimum views value
         sql = "SELECT id, filename, subreddit, width, height, views "
               "FROM wallpapers "
-              "WHERE views = (SELECT MIN(views) FROM wallpapers) "
-              "ORDER BY RANDOM() LIMIT 1;";
+              "WHERE active = 1 "
+              "ORDER BY views ASC, RANDOM() LIMIT 1;";
     } else {
         sql = "SELECT id, filename, subreddit, width, height, views "
-              "FROM wallpapers ORDER BY RANDOM() LIMIT 1;";
+              "FROM wallpapers "
+              "WHERE active = 1 "
+              "ORDER BY RANDOM() LIMIT 1;";
     }
 
     sqlite3_stmt* stmt = nullptr;
@@ -166,12 +168,32 @@ static bool SelectWallpaper(Wallpaper& out) {
 }
 
 // ─── Wallpaper application ───────────────────────────────────────────────────
+
+// Marks a wallpaper row inactive (file missing / inaccessible).
+static void DeactivateWallpaper(int64_t id) {
+    if (!g_db) return;
+    const char* sql = "UPDATE wallpapers SET active = 0 WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+}
+
+// Returns false (and deactivates the row) if the file does not exist on disk.
 static bool ApplyWallpaper(const Wallpaper& wp) {
     std::wstring path = g_config.reddit_wallpaper_path + L"\\wallpapers\\" + wp.filename;
 
-    // SystemParametersInfo requires the path to be stored persistently
+    // Check the file actually exists before handing it to the shell.
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        DeactivateWallpaper(wp.id);
+        return false;
+    }
+
+    // SystemParametersInfo requires the path to be stored persistently.
     // Use SPIF_UPDATEINIFILE | SPIF_SENDCHANGE so all monitors pick it up
-    // (Windows spans the wallpaper or tiles per monitor based on personalisation settings)
+    // (Windows spans the wallpaper or tiles per monitor based on personalisation settings).
     BOOL ok = SystemParametersInfoW(
         SPI_SETDESKWALLPAPER, 0,
         const_cast<wchar_t*>(path.c_str()),
@@ -180,10 +202,31 @@ static bool ApplyWallpaper(const Wallpaper& wp) {
 }
 
 // ─── Core action ─────────────────────────────────────────────────────────────
+
+// Returns the count of active wallpapers remaining in the DB.
+static int ActiveWallpaperCount() {
+    if (!g_db) return 0;
+    const char* sql = "SELECT COUNT(*) FROM wallpapers WHERE active = 1;";
+    sqlite3_stmt* stmt = nullptr;
+    int count = 0;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    return count;
+}
+
+// Keeps picking candidates until one is successfully applied or no active
+// wallpapers remain.  Files that are missing are deactivated on the fly so
+// they are never tried again.
 static void PickAndApplyRandom() {
-    Wallpaper wp{};
-    if (SelectWallpaper(wp)) {
-        ApplyWallpaper(wp);
+    while (ActiveWallpaperCount() > 0) {
+        Wallpaper wp{};
+        if (!SelectWallpaper(wp)) break;        // DB error or truly empty
+        if (ApplyWallpaper(wp)) break;          // success
+        // ApplyWallpaper returned false → file was missing, row deactivated;
+        // loop and try the next candidate.
     }
 }
 
