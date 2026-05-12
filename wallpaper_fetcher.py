@@ -682,6 +682,10 @@ def main():
     logger.info("═" * 60)
     logger.info("Done.")
 
+    # clear tmp files
+    for tmp_file in wallpaper_dir.glob("_tmp.*"):
+        logger.info(f"Clearing tmp file {tmp_file}.")
+        tmp_file.unlink(missing_ok=True)
 
 if __name__ == "__main__":
     main()
