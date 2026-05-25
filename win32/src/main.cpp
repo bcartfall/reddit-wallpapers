@@ -28,6 +28,116 @@
 
 using json = nlohmann::json;
 
+// ─── Logging ─────────────────────────────────────────────────────────────────
+
+static CRITICAL_SECTION g_logCS;
+static bool             g_logCSInit = false;
+
+// Returns exe dir (no trailing slash) — safe to call before g_config is set.
+static std::wstring GetExeDirEarly() {
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring p(buf);
+    auto pos = p.rfind(L'\\');
+    return (pos != std::wstring::npos) ? p.substr(0, pos) : p;
+}
+
+// Builds  <exedir>\reddit-wallpaper-YYYY-MM-DD.log
+static std::wstring GetLogPath() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t dateBuf[32];
+    swprintf_s(dateBuf, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+    return GetExeDirEarly() + L"\\reddit-wallpaper-" + dateBuf + L".log";
+}
+
+static void Log(const std::wstring& msg) {
+    if (g_logCSInit) EnterCriticalSection(&g_logCS);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t ts[32];
+    swprintf_s(ts, L"%04d-%02d-%02d %02d:%02d:%02d",
+               st.wYear, st.wMonth, st.wDay,
+               st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring line = std::wstring(ts) + L"  " + msg + L"\r\n";
+
+    // Append to today's log file (create if absent).
+    HANDLE hf = CreateFileW(
+        GetLogPath().c_str(),
+        FILE_APPEND_DATA, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf != INVALID_HANDLE_VALUE) {
+        // Write UTF-8
+        std::string utf8;
+        int n = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) {
+            utf8.resize(n - 1);
+            WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, &utf8[0], n, nullptr, nullptr);
+        }
+        DWORD written;
+        WriteFile(hf, utf8.c_str(), (DWORD)utf8.size(), &written, nullptr);
+        CloseHandle(hf);
+    }
+
+    if (g_logCSInit) LeaveCriticalSection(&g_logCS);
+}
+
+static void Log(const std::string& msg) {
+    // Convenience overload for narrow strings.
+    if (msg.empty()) return;
+    int n = MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, nullptr, 0);
+    std::wstring w(n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, &w[0], n);
+    Log(w);
+}
+
+// Delete log files older than 7 days from the exe directory.
+static void GarbageCollectLogs() {
+    std::wstring dir = GetExeDirEarly();
+    std::wstring pattern = dir + L"\\reddit-wallpaper-*.log";
+
+    // Reference point: 7 days ago as a FILETIME
+    SYSTEMTIME stNow;
+    GetSystemTime(&stNow);
+    FILETIME ftNow;
+    SystemTimeToFileTime(&stNow, &ftNow);
+    ULARGE_INTEGER uNow;
+    uNow.LowPart  = ftNow.dwLowDateTime;
+    uNow.HighPart = ftNow.dwHighDateTime;
+
+    // 7 days in 100-nanosecond intervals
+    constexpr ULONGLONG k7Days = 7ULL * 24 * 60 * 60 * 10000000ULL;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    int deleted = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+        ULARGE_INTEGER uFile;
+        uFile.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+        uFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+
+        if (uNow.QuadPart > uFile.QuadPart &&
+            (uNow.QuadPart - uFile.QuadPart) > k7Days)
+        {
+            std::wstring fullPath = dir + L"\\" + fd.cFileName;
+            if (DeleteFileW(fullPath.c_str())) ++deleted;
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    if (deleted > 0) {
+        wchar_t buf[64];
+        swprintf_s(buf, L"GC: deleted %d log file(s) older than 7 days", deleted);
+        Log(buf);
+    }
+}
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 static const UINT WM_TRAYICON      = WM_APP + 1;
 static const UINT ID_TRAY_SELECT   = WM_APP + 2;
@@ -106,6 +216,11 @@ static bool OpenDatabase() {
     std::wstring dbPath = g_config.reddit_wallpaper_path + L"\\db\\wallpapers.db";
     std::string  dbPathU8 = WideToUtf8(dbPath);
     int rc = sqlite3_open(dbPathU8.c_str(), &g_db);
+    if (rc == SQLITE_OK) {
+        Log(L"DB opened: " + dbPath);
+    } else {
+        Log(L"DB open FAILED: " + dbPath);
+    }
     return (rc == SQLITE_OK);
 }
 
@@ -155,6 +270,11 @@ static bool SelectWallpaper(Wallpaper& out) {
     sqlite3_finalize(stmt);
 
     if (found) {
+        wchar_t buf[256];
+        swprintf_s(buf, L"Selected wallpaper id=%lld views=%d [%s] %s",
+                   out.id, out.views, out.subreddit.c_str(), out.filename.c_str());
+        Log(buf);
+
         // Increment views
         std::string upd = "UPDATE wallpapers SET views = views + 1 WHERE id = ?;";
         sqlite3_stmt* upd_stmt = nullptr;
@@ -172,6 +292,9 @@ static bool SelectWallpaper(Wallpaper& out) {
 // Marks a wallpaper row inactive (file missing / inaccessible).
 static void DeactivateWallpaper(int64_t id) {
     if (!g_db) return;
+    wchar_t buf[64];
+    swprintf_s(buf, L"Deactivating wallpaper id=%lld (file missing)", id);
+    Log(buf);
     const char* sql = "UPDATE wallpapers SET active = 0 WHERE id = ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
@@ -187,6 +310,7 @@ static bool ApplyWallpaper(const Wallpaper& wp) {
 
     // Check the file actually exists before handing it to the shell.
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        Log(L"Wallpaper file not found, deactivating: " + path);
         DeactivateWallpaper(wp.id);
         return false;
     }
@@ -198,6 +322,11 @@ static bool ApplyWallpaper(const Wallpaper& wp) {
         SPI_SETDESKWALLPAPER, 0,
         const_cast<wchar_t*>(path.c_str()),
         SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    if (ok) {
+        Log(L"Wallpaper applied: " + path);
+    } else {
+        Log(L"SystemParametersInfoW FAILED for: " + path);
+    }
     return ok != FALSE;
 }
 
@@ -219,15 +348,31 @@ static int ActiveWallpaperCount() {
 
 // Keeps picking candidates until one is successfully applied or no active
 // wallpapers remain.  Files that are missing are deactivated on the fly so
-// they are never tried again.
+// they are never tried again.  The DB is opened for the duration of this
+// function only and closed before returning.
 static void PickAndApplyRandom() {
+    Log(L"PickAndApplyRandom: starting selection");
+
+    if (!OpenDatabase()) {
+        Log(L"PickAndApplyRandom: could not open DB, aborting");
+        return;
+    }
+
+    if (ActiveWallpaperCount() == 0) {
+        Log(L"PickAndApplyRandom: no active wallpapers in DB");
+        CloseDatabase();
+        return;
+    }
+
     while (ActiveWallpaperCount() > 0) {
         Wallpaper wp{};
-        if (!SelectWallpaper(wp)) break;        // DB error or truly empty
-        if (ApplyWallpaper(wp)) break;          // success
+        if (!SelectWallpaper(wp)) { Log(L"PickAndApplyRandom: SelectWallpaper returned no result"); break; }
+        if (ApplyWallpaper(wp)) break;
         // ApplyWallpaper returned false → file was missing, row deactivated;
         // loop and try the next candidate.
     }
+
+    CloseDatabase();
 }
 
 // ─── Tray icon ───────────────────────────────────────────────────────────────
@@ -337,13 +482,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         // Timer: milliseconds
         SetTimer(hwnd, ID_TIMER, g_config.minutes * 60 * 1000, nullptr);
+        Log(L"Timer started (" + std::to_wstring(g_config.minutes) + L" min interval)");
         return 0;
 
     case WM_TIMER:
         if (wp == ID_TIMER) {
+            Log(L"Timer fired: rotating wallpaper");
             PickAndApplyRandom();
         }
         return 0;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC) {
+            Log(L"System resumed from sleep: rotating wallpaper and resetting timer");
+            PickAndApplyRandom();
+            KillTimer(hwnd, ID_TIMER);
+            SetTimer(hwnd, ID_TIMER, g_config.minutes * 60 * 1000, nullptr);
+        }
+        return TRUE;
 
     case WM_TRAYICON:
         if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) {
@@ -354,15 +510,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_TRAY_SELECT:
+            Log(L"User requested wallpaper change via tray menu");
             PickAndApplyRandom();
             break;
         case ID_TRAY_EXIT:
+            Log(L"User requested exit via tray menu");
             DestroyWindow(hwnd);
             break;
         }
         return 0;
 
     case WM_DESTROY:
+        Log(L"Shutting down");
         KillTimer(hwnd, ID_TIMER);
         RemoveTrayIcon();
         PostQuitMessage(0);
@@ -373,9 +532,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // Initialise logging critical section
+    InitializeCriticalSection(&g_logCS);
+    g_logCSInit = true;
+
+    Log(L"---- reddit-wallpaper starting ----");
+
+    // Garbage-collect old log files before anything else
+    GarbageCollectLogs();
+
     // Load config from same directory as exe
     std::wstring cfgPath = GetExeDir() + L"\\config.json";
     if (!LoadConfig(cfgPath)) {
+        Log(L"FATAL: failed to load config from " + cfgPath);
         MessageBoxW(nullptr,
             L"Failed to load config.json.\n\n"
             L"Expected format:\n"
@@ -388,13 +557,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
+    Log(L"Config loaded: path=" + g_config.reddit_wallpaper_path +
+        L"  interval=" + std::to_wstring(g_config.minutes) + L" min");
+
+    // Validate the DB is reachable at startup with a quick open/close check.
     if (!OpenDatabase()) {
         std::wstring msg = L"Failed to open database:\n" +
             g_config.reddit_wallpaper_path + L"\\db\\wallpapers.db";
+        Log(L"FATAL: " + msg);
         MessageBoxW(nullptr, msg.c_str(), L"Reddit Wallpapers - DB Error",
                     MB_ICONERROR | MB_OK);
         return 1;
     }
+    CloseDatabase();  // DB is opened/closed per rotation; this was just a connectivity check.
 
     // Register window class
     WNDCLASSEXW wc = {};
@@ -428,7 +603,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    CloseDatabase();
     DestroyIcon(hIcon);
+    DeleteCriticalSection(&g_logCS);
     return (int)msg.wParam;
 }
