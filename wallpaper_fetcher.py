@@ -4,6 +4,7 @@ Reddit Wallpaper Fetcher
 Fetches top wallpapers from configured subreddits using the Reddit JSON API.
 """
 
+from curl_cffi import requests as cffi_requests
 import json
 import logging
 import os
@@ -18,6 +19,20 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 
+def load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ (existing vars win)."""
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key.strip(), value)
+
+load_dotenv()
 
 # ─────────────────────────── Logging Setup ───────────────────────────────────
 
@@ -220,27 +235,33 @@ def safe_filename(title: str, ext: str, subreddit: str, dims: tuple[int, int] | 
 HEADERS = {
     "User-Agent": "WallpaperFetcher/1.0 (python; educational use)"
 }
+REDDIT_COOKIE = os.environ.get("REDDIT_COOKIE", "")  # keep out of source control
 
+def reddit_headers() -> dict:
+    h = dict(HEADERS)
+    # A browser-like UA often helps as well
+    h["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36")
+    if REDDIT_COOKIE:
+        h["Cookie"] = REDDIT_COOKIE
+    return h
 
 def reddit_request(url: str, logger: logging.Logger) -> dict | None:
-    """Perform a GET request to the Reddit JSON API with basic rate-limit handling."""
     logger.debug(f"GET {url}")
-    req = urllib.request.Request(url, headers=HEADERS)
+    headers = {"Cookie": REDDIT_COOKIE} if REDDIT_COOKIE else None
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if resp.status == 200:
-                return json.loads(resp.read().decode("utf-8"))
-            logger.warning(f"HTTP {resp.status} for {url}")
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            logger.warning("Rate-limited by Reddit — sleeping 5 s …")
-            time.sleep(5)
+        # No custom User-Agent: impersonate="chrome" sends a consistent Chrome one
+        r = cffi_requests.get(url, impersonate="chrome", headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429:
+            logger.warning("Rate-limited by Reddit, sleeping 10 s …")
+            time.sleep(10)
         else:
-            logger.error(f"HTTP error {e.code}: {e.reason} — {url}")
-    except urllib.error.URLError as e:
-        logger.error(f"URL error: {e.reason} — {url}")
+            logger.error(f"HTTP error {r.status_code} — {url}")
     except Exception as e:
-        logger.error(f"Unexpected error fetching {url}: {e}")
+        logger.error(f"Error fetching {url}: {e}")
     return None
 
 
@@ -256,7 +277,7 @@ def fetch_posts(subreddit: str, sort: str, time_filter: str,
 
     while len(posts) < limit:
         batch = min(100, limit - len(posts))
-        url = f"https://www.reddit.com/r/{subreddit}/{sort}.json?limit={batch}&t={time_filter}"
+        url = f"https://old.reddit.com/r/{subreddit}/{sort}.json?limit={batch}&t={time_filter}"
         if after:
             url += f"&after={after}"
 
